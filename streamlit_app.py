@@ -29,6 +29,462 @@ from tensorflow.keras.preprocessing import image
 # Local hero image path (your uploaded asset)
 # -------------------------
 HERO_IMAGE_PATH = "assets/hero.png"
+# streamlit_app.py
+"""
+Hybrid Variant C - Smart Waste Classifier
+Features:
+- Step-by-step wizard (1. Choose Input Method -> 2. Upload/Capture -> 3. See Results)
+- Clean green UI (NO background image)
+- Upload / Camera / URL options arranged neatly
+- Animated transitions (CSS), icons, badges
+- Backend: MobileNetV2 (ImageNet) mapping -> waste categories
+- PDF report generator
+- Cached model loading
+- Single-file app
+"""
+
+import streamlit as st
+from io import BytesIO
+import tempfile
+import os
+import numpy as np
+from PIL import Image, ImageOps
+import requests
+from fpdf import FPDF
+
+# TensorFlow / Keras
+from tensorflow.keras.applications.mobilenet_v2 import (
+    MobileNetV2,
+    preprocess_input,
+    decode_predictions,
+)
+from tensorflow.keras.preprocessing import image
+
+# ---------------------------
+# Page config
+# ---------------------------
+st.set_page_config(
+    page_title="EcoScan — Waste Classifier (Hybrid UI)",
+    page_icon="♻️",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+# ---------------------------
+# CSS (light green background, NO IMAGE)
+# ---------------------------
+st.markdown(
+    """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600;700&display=swap');
+
+:root {
+  --green-1: #e6f6ec;
+  --green-2: #bfead0;
+  --accent: #2f855a;
+  --accent-2: #16a34a;
+  --muted: #64748b;
+  --card-bg: rgba(255,255,255,0.9);
+}
+
+html, body, [class*="css"] {
+  font-family: "Poppins", sans-serif;
+}
+
+/* Clean light-green background */
+[data-testid="stAppViewContainer"] {
+  background: linear-gradient(135deg, #e8f8ee 0%, #d6f3e3 100%);
+}
+
+/* Top hero area */
+.hero {
+  padding: 22px;
+  border-radius: 16px;
+  margin-bottom: 18px;
+  background: linear-gradient(180deg, rgba(255,255,255,0.8), rgba(250,255,250,0.8));
+  box-shadow: 0 8px 40px rgba(16,24,40,0.06);
+}
+
+/* Wizard steps */
+.steps {
+  display:flex;
+  gap:14px;
+  align-items:center;
+  flex-wrap:wrap;
+}
+.step {
+  padding:10px 18px;
+  border-radius:999px;
+  background:linear-gradient(90deg, #ffffff, #f2fff6);
+  box-shadow: 0 6px 18px rgba(16,24,40,0.04);
+  font-weight:600;
+  color:#063d16;
+  display:flex;
+  gap:10px;
+  align-items:center;
+  transition: transform .18s ease, box-shadow .18s ease;
+}
+.step.active {
+  transform: translateY(-4px);
+  box-shadow: 0 18px 40px rgba(23,64,37,0.12);
+  background: linear-gradient(90deg, #dff7e9, #c6f0da);
+}
+.step .dot {
+  width:28px; height:28px; border-radius:50%;
+  background:linear-gradient(90deg,var(--accent),var(--accent-2));
+  color:white; display:flex; align-items:center; justify-content:center; font-weight:700;
+}
+
+/* Cards */
+.card {
+  background: var(--card-bg);
+  padding:18px;
+  border-radius:14px;
+  box-shadow: 0 10px 30px rgba(16,24,40,0.06);
+  margin-bottom:18px;
+}
+
+/* Input tiles */
+.input-tiles {
+  display:flex;
+  gap:14px;
+  flex-wrap:wrap;
+}
+.tile {
+  flex:1 1 220px;
+  min-width:180px;
+  background: linear-gradient(180deg,#fff,#f7fff8);
+  border-radius:12px;
+  padding:18px;
+  text-align:center;
+  cursor:pointer;
+  transition: transform .14s ease, box-shadow .14s ease;
+  border:1px solid rgba(18,80,50,0.04);
+}
+.tile:hover{
+  transform: translateY(-6px);
+  box-shadow: 0 14px 30px rgba(20,70,40,0.06);
+}
+
+.small-muted { color:#475569; font-size:13px; }
+
+/* Result badge styles */
+.badge {
+  padding:8px 14px;
+  border-radius:999px;
+  color:white; font-weight:700;
+  display:inline-block;
+}
+.badge-plastic { background: linear-gradient(90deg,#ff6b6b,#ff3b30); }
+.badge-metal { background: linear-gradient(90deg,#6b7280,#374151); }
+.badge-paper { background: linear-gradient(90deg,#3b82f6,#2563eb); }
+.badge-cardboard { background: linear-gradient(90deg,#d97706,#a16207); }
+.badge-biological { background: linear-gradient(90deg,#10b981,#059669); }
+.badge-trash { background: linear-gradient(90deg,#ef4444,#f97316); }
+.badge-default { background: linear-gradient(90deg,#9ca3af,#6b7280); }
+
+.preview {
+  border-radius:12px;
+  overflow:hidden;
+  border:1px solid rgba(10,20,10,0.03);
+}
+
+@media (max-width: 800px) {
+  .input-tiles { flex-direction:column; }
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+# ---------------------------
+# Hero section
+# ---------------------------
+st.markdown('<div class="hero card">', unsafe_allow_html=True)
+colh1, colh2 = st.columns([3, 1])
+with colh1:
+    st.markdown("<h2 style='margin:0'>♻ EcoScan — Smart Waste Classifier</h2>", unsafe_allow_html=True)
+    st.markdown("<div class='small-muted'>Step-by-step wizard to upload/capture & classify waste instantly.</div>", unsafe_allow_html=True)
+with colh2:
+    st.markdown("<div class='center'><img src='https://img.icons8.com/fluency/48/000000/recycle.png'></div>", unsafe_allow_html=True)
+st.markdown("</div>", unsafe_allow_html=True)
+
+# ---------------------------
+# Load model
+# ---------------------------
+@st.cache_resource
+def load_model():
+    return MobileNetV2(weights="imagenet")
+
+model = load_model()
+
+# ---------------------------
+# Waste map & metadata
+# ---------------------------
+waste_map = {
+    "battery": ["battery","accumulator","cell"],
+    "biological": [
+        "banana","apple","vegetable","fruit","leaf","leaves","branch","twig","plant","flower"
+    ],
+    "cardboard": ["carton","cardboard","box"],
+    "clothes": ["t-shirt","jeans","sweater","coat","cloth"],
+    "metal": ["can","tin","aluminum","metal"],
+    "paper": ["newspaper","envelope","paper","book_jacket","notebook"],
+    "plastic": ["plastic","plastic_bag","water_bottle","packet","bottlecap","container"],
+    "shoes": ["shoe","sneaker","boot","sandal"],
+    "trash": ["garbage","trash_can","waste"],
+    "white-glass": ["glass","clear_glass","glassware"]
+}
+
+recyclability = {
+    "battery":20,"biological":95,"cardboard":92,"clothes":60,"metal":98,
+    "paper":88,"plastic":55,"shoes":40,"trash":10,"white-glass":90
+}
+
+instructions = {
+    "battery":"Do not throw in trash. Use battery recycling bins.",
+    "biological":"Compost or dispose in organic waste.",
+    "cardboard":"Flatten and keep dry before recycling.",
+    "clothes":"Donate usable clothes or recycle textiles.",
+    "metal":"Rinse and recycle metal cans.",
+    "paper":"Recycle clean and dry paper.",
+    "plastic":"Rinse and follow local recycling rules.",
+    "shoes":"Donate or recycle via shoe programs.",
+    "trash":"Dispose in general waste.",
+    "white-glass":"Rinse and recycle clear glass."
+}
+
+carbon_score = {
+    "battery":5,"biological":1,"cardboard":2,"clothes":3,"metal":4,
+    "paper":2,"plastic":5,"shoes":3,"trash":4,"white-glass":3
+}
+
+# ---------------------------
+# Helpers
+# ---------------------------
+def pil_from_upload(u): return Image.open(u).convert("RGB")
+
+def load_image_from_url(url):
+    r = requests.get(url, timeout=10); r.raise_for_status()
+    return Image.open(BytesIO(r.content)).convert("RGB")
+
+def preprocess_pil(img, size=(224,224)):
+    img_r = img.resize(size)
+    arr = image.img_to_array(img_r)
+    x = np.expand_dims(arr,0)
+    x = preprocess_input(x)
+    return x, arr
+
+def map_imagenet_to_waste(label):
+    label = label.lower()
+    for w,keys in waste_map.items():
+        if any(k in label for k in keys):
+            return w
+    return "trash"
+
+def estimate_quantity(arr):
+    pil = Image.fromarray(arr.astype('uint8'))
+    gray = ImageOps.grayscale(pil).resize((224,224))
+    a = np.array(gray).astype(float)
+    mask = a < (np.median(a)*0.85)
+    p = mask.sum()/mask.size
+    return "Large" if p>0.30 else "Medium" if p>0.12 else "Small"
+
+def compute_recyclability_score(w,c):
+    base = recyclability.get(w,50)
+    return max(0,min(100,int(base*(0.5+0.5*(c/100)))))
+
+def compute_carbon(w):
+    lvl = carbon_score.get(w,3)
+    return lvl, round(lvl*2.0,2)
+
+def create_pdf_report(report, image_pil):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=12)
+    pdf.cell(0,10,"EcoScan - Waste Report",ln=True,align="C")
+    pdf.set_font("Arial", size=10)
+    for k,v in report.items():
+        pdf.multi_cell(0,8,f"{k}: {v}")
+    if image_pil:
+        with tempfile.NamedTemporaryFile(delete=False,suffix=".png") as tmp:
+            image_pil.save(tmp.name,"PNG")
+            pdf.image(tmp.name,w=120)
+            os.unlink(tmp.name)
+    with tempfile.NamedTemporaryFile(delete=False,suffix=".pdf") as tmp:
+        pdf.output(tmp.name)
+        data=open(tmp.name,"rb").read()
+        os.unlink(tmp.name)
+    return data
+
+# ---------------------------
+# Wizard State
+# ---------------------------
+if "step" not in st.session_state: st.session_state.step=1
+if "chosen_method" not in st.session_state: st.session_state.chosen_method=None
+if "uploaded_image" not in st.session_state: st.session_state.uploaded_image=None
+if "image_url" not in st.session_state: st.session_state.image_url=""
+if "camera_image" not in st.session_state: st.session_state.camera_image=None
+
+# ---------------------------
+# Step 1 – Input Method
+# ---------------------------
+st.markdown('<div class="card">', unsafe_allow_html=True)
+st.markdown('<div class="steps">', unsafe_allow_html=True)
+
+def _step_html(n,l,active=False):
+    return f'<div class="step {"active" if active else ""}"><div class="dot">{n}</div>{l}</div>'
+
+st.markdown(_step_html(1,"Choose Input",st.session_state.step==1),unsafe_allow_html=True)
+st.markdown(_step_html(2,"Upload / Capture",st.session_state.step==2),unsafe_allow_html=True)
+st.markdown(_step_html(3,"Results",st.session_state.step==3),unsafe_allow_html=True)
+st.markdown('</div>', unsafe_allow_html=True)
+
+st.markdown("<h4>Step 1 — Choose input method</h4>",unsafe_allow_html=True)
+
+col1,col2,col3 = st.columns(3)
+with col1:
+    if st.button("📁 Upload Image"): 
+        st.session_state.step=2; st.session_state.chosen_method="upload"
+with col2:
+    if st.button("📷 Use Camera"):
+        st.session_state.step=2; st.session_state.chosen_method="camera"
+with col3:
+    if st.button("🔗 Paste Image URL"):
+        st.session_state.step=2; st.session_state.chosen_method="url"
+
+st.markdown("</div>",unsafe_allow_html=True)
+
+# ---------------------------
+# Step 2 – Upload / Capture
+# ---------------------------
+if st.session_state.step==2:
+    st.markdown('<div class="card">',unsafe_allow_html=True)
+    st.markdown("<h4>Step 2 — Upload / Capture</h4>",unsafe_allow_html=True)
+
+    if st.session_state.chosen_method=="upload":
+        img = st.file_uploader("Choose image (jpg/png)",type=["jpg","jpeg","png"])
+        if img:
+            st.session_state.uploaded_image = pil_from_upload(img)
+            if st.button("➡ Go to Results"):
+                st.session_state.step=3
+
+    elif st.session_state.chosen_method=="camera":
+        cam = st.camera_input("Take a photo")
+        if cam:
+            st.session_state.camera_image = Image.open(cam).convert("RGB")
+            if st.button("➡ Go to Results"):
+                st.session_state.step=3
+
+    elif st.session_state.chosen_method=="url":
+        url = st.text_input("Enter image URL", value=st.session_state.image_url)
+        if st.button("Load from URL"):
+            try:
+                st.session_state.uploaded_image = load_image_from_url(url)
+                st.session_state.image_url = url
+                st.success("Loaded successfully.")
+            except:
+                st.error("Invalid URL.")
+        if st.button("➡ Go to Results"):
+            if st.session_state.uploaded_image is not None:
+                st.session_state.step=3
+            else:
+                st.warning("Please load image.")
+
+    if st.button("⬅ Back"):
+        st.session_state.step=1; st.session_state.chosen_method=None
+
+    st.markdown("</div>",unsafe_allow_html=True)
+
+# ---------------------------
+# Step 3 – Results
+# ---------------------------
+if st.session_state.step==3:
+
+    img = st.session_state.camera_image or st.session_state.uploaded_image
+    if img is None:
+        st.error("No image. Go back.")
+    else:
+        st.markdown('<div class="card">',unsafe_allow_html=True)
+        st.markdown("<h4>Step 3 — Results</h4>",unsafe_allow_html=True)
+
+        lc, rc = st.columns([1.2,1])
+
+        with lc:
+            st.markdown("<div class='preview'>",unsafe_allow_html=True)
+            st.image(img,use_column_width=True)
+            st.markdown("</div>",unsafe_allow_html=True)
+
+        x, arr = preprocess_pil(img)
+        preds = model.predict(x)
+        decoded = decode_predictions(preds,top=3)[0]
+
+        top_list=[]
+        for p in decoded:
+            lbl = p[1]
+            conf = p[2]*100
+            mapped = map_imagenet_to_waste(lbl)
+            top_list.append({"imagenet_label":lbl,"confidence":conf,"mapped":mapped})
+
+        final = top_list[0]
+        waste = final["mapped"]
+        conf = final["confidence"]
+        qty = estimate_quantity(arr)
+        recy = compute_recyclability_score(waste,conf)
+        lvl, co2 = compute_carbon(waste)
+        disp = instructions.get(waste,"Follow rules.")
+
+        with rc:
+            st.markdown(f"<div class='badge badge-{waste.replace('-','_')}' style='font-size:18px'>{waste.upper()}</div>",unsafe_allow_html=True)
+            st.markdown(f"**Top Label:** `{final['imagenet_label']}`")
+            st.markdown(f"**Confidence:** {conf:.2f}%")
+            st.markdown(f"**Estimated Quantity:** {qty}")
+            st.markdown(f"**Recyclability Score:** {recy}/100")
+            st.progress(recy/100)
+            st.markdown(f"**Carbon Level:** {lvl} (~{co2} kg CO₂)")
+            st.success(disp)
+
+        st.markdown("---")
+        st.subheader("Top Predictions")
+        for i,t in enumerate(top_list,1):
+            st.write(f"{i}. `{t['imagenet_label']}` — {t['confidence']:.2f}% → **{t['mapped']}**")
+
+        report = {
+            "Waste Type": waste,
+            "Top Label": final['imagenet_label'],
+            "Confidence (%)": f"{conf:.2f}",
+            "Quantity Estimate": qty,
+            "Recyclability": f"{recy}/100",
+            "Carbon": f"{lvl} (~{co2}kg CO2)",
+            "Instructions": disp,
+        }
+
+        pdf = create_pdf_report(report,img)
+
+        colA,colB = st.columns(2)
+        with colA:
+            if st.button("🔁 Analyze New Image"):
+                st.session_state.step=1
+                st.session_state.uploaded_image=None
+                st.session_state.camera_image=None
+                st.session_state.image_url=""
+                st.session_state.chosen_method=None
+                st.experimental_rerun()
+
+        with colB:
+            st.download_button("📄 Download PDF",data=pdf,file_name="ecoscan_report.pdf",mime="application/pdf")
+
+        st.markdown("</div>",unsafe_allow_html=True)
+
+# ---------------------------
+# Footer
+# ---------------------------
+st.markdown(
+    "<div style='text-align:center; margin-top:18px; color:#475569; font-size:13px'>"
+    "Model uses MobileNetV2 (ImageNet). For production, use YOLO/DETR fine-tuned on waste datasets."
+    "</div>",
+    unsafe_allow_html=True,
+)
 
 # -------------------------
 # Page config
